@@ -4,4 +4,4 @@ dist
 .env.local
 *.log
 service-account*.json
-drizzle
+# drizzle/ (migrasi) sengaja di-commit

@@ -1,10 +1,13 @@
 import { Hono } from 'hono';
+import { and, eq } from 'drizzle-orm';
 import { authMiddleware } from '../middlewares/auth.middleware';
 import { DriveService } from '../services/drive.service';
-import { successResponse, errorResponse } from '../utils/response';
+import { successResponse } from '../utils/response';
 import { db } from '../db';
 import { folders } from '../db/schema';
-import { eq, and } from 'drizzle-orm';
+import { notFound } from '../lib/errors';
+import { readJson } from '../lib/request';
+import { createFolderSchema, parseOrThrow, positionSchema, uuidSchema } from '../lib/validation';
 
 type Variables = {
   userId: string;
@@ -12,72 +15,35 @@ type Variables = {
 
 export const foldersRoute = new Hono<{ Variables: Variables }>();
 
-// GET /folders (List all folders in user's DB/Drive)
+// GET /folders — folder diambil langsung dari Google Drive (sumber kebenaran)
 foldersRoute.get('/', authMiddleware, async (c) => {
-  try {
-    const userId = c.get('userId');
-    // Fetch directly from Google Drive to ensure all actual folders are shown
-    const folders = await DriveService.listFolders(userId);
-    return c.json(successResponse(folders, 'Folders retrieved successfully'));
-  } catch (error: any) {
-    console.error('List folders error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
+  const driveFolders = await DriveService.listFolders(c.get('userId'));
+  return c.json(successResponse(driveFolders, 'Folders retrieved successfully'));
 });
 
-// POST /folders (Create a new folder in user's Drive and DB)
+// POST /folders — buat folder di Drive dan catat di DB
 foldersRoute.post('/', authMiddleware, async (c) => {
-  try {
-    const userId = c.get('userId');
-    const body = await c.req.json();
-    const folderName = body.name;
+  const userId = c.get('userId');
+  const { name } = parseOrThrow(createFolderSchema, await readJson(c));
 
-    if (!folderName || typeof folderName !== 'string') {
-      return c.json(errorResponse('Folder name is required', 400), 400);
-    }
+  const driveFolder = await DriveService.createFolder(name, userId);
+  await db.insert(folders).values({ userId, driveFolderId: driveFolder.id!, name });
 
-    const driveFolder = await DriveService.createFolder(folderName, userId);
-    
-    // Insert into DB
-    const [newFolder] = await db.insert(folders).values({
-      userId,
-      driveFolderId: driveFolder.id!,
-      name: folderName,
-      posX: 0,
-      posY: 0,
-    }).returning();
-
-    return c.json(successResponse(newFolder, 'Folder created successfully'), 201);
-  } catch (error: any) {
-    console.error('Create folder error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
+  // Bentuk respons sama dengan GET /folders: `id` adalah ID folder Drive.
+  return c.json(successResponse({ id: driveFolder.id!, name }, 'Folder created successfully'), 201);
 });
 
-// PUT /folders/:id/position (Protected)
+// PUT /folders/:id/position
 foldersRoute.put('/:id/position', authMiddleware, async (c) => {
-  try {
-    const folderId = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-    const body = await c.req.json();
-    const { posX, posY } = body;
+  const folderId = parseOrThrow(uuidSchema, c.req.param('id'));
+  const { posX, posY } = parseOrThrow(positionSchema, await readJson(c));
 
-    if (typeof posX !== 'number' || typeof posY !== 'number') {
-      return c.json(errorResponse('posX and posY are required and must be numbers', 400), 400);
-    }
+  const [updatedFolder] = await db
+    .update(folders)
+    .set({ posX, posY })
+    .where(and(eq(folders.id, folderId), eq(folders.userId, c.get('userId'))))
+    .returning();
 
-    const [updatedFolder] = await db.update(folders)
-      .set({ posX, posY })
-      .where(and(eq(folders.id, folderId), eq(folders.userId, userId)))
-      .returning();
-
-    if (!updatedFolder) {
-      return c.json(errorResponse('Folder not found', 404), 404);
-    }
-
-    return c.json(successResponse(updatedFolder, 'Position updated'));
-  } catch (error: any) {
-    console.error('Update position error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
+  if (!updatedFolder) throw notFound('Folder tidak ditemukan');
+  return c.json(successResponse(updatedFolder, 'Position updated'));
 });

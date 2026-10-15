@@ -1,31 +1,27 @@
 import { Context, Next } from 'hono';
+import { getCookie } from 'hono/cookie';
+import { and, eq, gt } from 'drizzle-orm';
 import { errorResponse } from '../utils/response';
 import { db } from '../db';
 import { sessions } from '../db/schema';
-import { eq } from 'drizzle-orm';
-import { getCookie } from 'hono/cookie';
 
 export const authMiddleware = async (c: Context, next: Next) => {
-  // Ambil token sesi dari cookie yang dikirim NextAuth
-  const token = getCookie(c, 'next-auth.session-token') || getCookie(c, '__Secure-next-auth.session-token');
+  // Token sesi database dari NextAuth (cookie __Secure- dipakai saat HTTPS)
+  const token = getCookie(c, '__Secure-next-auth.session-token') || getCookie(c, 'next-auth.session-token');
 
-  if (!token) {
-    return c.json(errorResponse('Unauthorized: No session token found', 401), 401);
+  if (!token || token.length > 512) {
+    return c.json(errorResponse('Unauthorized: sesi tidak ditemukan', 401), 401);
   }
 
-  try {
-    const [session] = await db.select().from(sessions).where(eq(sessions.sessionToken, token));
-    
-    if (!session || session.expires < new Date()) {
-      return c.json(errorResponse('Unauthorized: Invalid or expired session', 401), 401);
-    }
-    
-    // Set userId in context
-    c.set('userId', session.userId);
-  } catch (error) {
-    console.error('Session verification error:', error);
-    return c.json(errorResponse('Server error during auth', 500), 500);
+  const [session] = await db
+    .select({ userId: sessions.userId })
+    .from(sessions)
+    .where(and(eq(sessions.sessionToken, token), gt(sessions.expires, new Date())));
+
+  if (!session) {
+    return c.json(errorResponse('Unauthorized: sesi tidak valid atau kedaluwarsa', 401), 401);
   }
 
+  c.set('userId', session.userId);
   await next();
 };

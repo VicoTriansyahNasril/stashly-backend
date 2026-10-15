@@ -1,548 +1,435 @@
-import { Hono } from 'hono';
-import { db } from '../db';
+import { Context, Hono } from 'hono';
 import * as bcrypt from 'bcryptjs';
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, like, sql } from 'drizzle-orm';
+import { db } from '../db';
 import { files, users } from '../db/schema';
-import { eq, and, sql, ilike, desc, asc, isNull, isNotNull } from 'drizzle-orm';
 import { DriveService } from '../services/drive.service';
-import { successResponse, errorResponse } from '../utils/response';
-import { rateLimitMiddleware } from '../middlewares/rateLimit.middleware';
-import { validateFileMiddleware } from '../middlewares/validateFile.middleware';
+import {
+  FileRecord,
+  publiclyAccessible,
+  releaseStorage,
+  reserveStorage,
+  toOwnerFile,
+  toPublicFile,
+} from '../services/file.service';
+import { successResponse } from '../utils/response';
 import { authMiddleware } from '../middlewares/auth.middleware';
+import { unlockRateLimit, uploadRateLimit } from '../middlewares/rateLimit.middleware';
+import { uploadBodyLimit, validateFileMiddleware } from '../middlewares/validateFile.middleware';
+import { AppError, badRequest, notFound, unauthorized } from '../lib/errors';
+import { isInlineSafe, setFileResponseHeaders } from '../lib/fileHeaders';
+import { createStreamToken, verifyStreamToken } from '../lib/streamToken';
+import { mapWithConcurrency, readJson } from '../lib/request';
+import {
+  FILE_TYPE_FILTERS,
+  driveFolderIdSchema,
+  escapeLike,
+  futureDateSchema,
+  listQuerySchema,
+  parseOrThrow,
+  positionSchema,
+  publicListQuerySchema,
+  renameSchema,
+  sharePasswordSchema,
+  shareSettingsSchema,
+  syncSchema,
+  unlockSchema,
+  uuidSchema,
+} from '../lib/validation';
+import { z } from 'zod';
 
 type Variables = {
   validatedFile: File;
+  uploadBody: Record<string, string | File | (string | File)[]>;
   userId: string;
 };
 
+const BCRYPT_ROUNDS = 12;
+const GOOGLE_APPS_MIME_PREFIX = 'application/vnd.google-apps.';
+
 export const filesRoute = new Hono<{ Variables: Variables }>();
 
-// POST /files/upload (Protected)
-filesRoute.post('/upload', authMiddleware, rateLimitMiddleware, validateFileMiddleware, async (c) => {
-  try {
-    const file = c.get('validatedFile') as File;
-    const userId = c.get('userId') as string;
-    const body = await c.req.parseBody();
-    
-    // Check Storage Limit
-    const [user] = await db.select().from(users).where(eq(users.id, userId));
-    if (!user) return c.json(errorResponse('User not found', 404), 404);
-    
-    const newStorageUsed = Number(user.storageUsed) + file.size;
-    if (newStorageUsed > Number(user.storageLimit)) {
-      return c.json(errorResponse('Storage limit exceeded', 400), 400);
-    }
+const fileIdParam = (c: Context) => parseOrThrow(uuidSchema, c.req.param('id'));
 
-    const isPublic = body['isPublic'] !== 'false';
-    const password = typeof body['password'] === 'string' && body['password'].length > 0 ? body['password'] : null;
-    const expiresAtStr = typeof body['expiresAt'] === 'string' ? body['expiresAt'] : null;
-    const expiresAt = expiresAtStr ? new Date(expiresAtStr) : null;
-    const folderId = typeof body['folderId'] === 'string' ? body['folderId'] : undefined;
+const findOwnedFile = async (id: string, userId: string, state: 'active' | 'trashed' | 'any' = 'any') => {
+  const stateCondition =
+    state === 'active' ? isNull(files.deletedAt) : state === 'trashed' ? isNotNull(files.deletedAt) : undefined;
+  const [record] = await db
+    .select()
+    .from(files)
+    .where(and(eq(files.id, id), eq(files.userId, userId), stateCondition));
+  if (!record) throw notFound('File tidak ditemukan');
+  return record;
+};
 
-    // 1. Upload to User's Google Drive
-    const driveFileId = await DriveService.uploadToDrive(file, userId, folderId);
-
-    // 2. Generate public links
-    let links = { webContentLink: null as string | null, webViewLink: null as string | null };
-    if (isPublic) {
-      links = await DriveService.generatePublicLink(driveFileId, userId);
-    }
-
-    // 3. Save to DB with userId
-    const [newFile] = await db.insert(files).values({
-      userId,
-      folderId,
-      driveFileId,
-      fileName: file.name,
-      fileType: file.type,
-      fileSize: file.size,
-      isPublic,
-      password: password ? await bcrypt.hash(password, 10) : null,
-      expiresAt,
-      webContentLink: links.webContentLink,
-      webViewLink: links.webViewLink,
-    }).returning();
-
-    // 4. Update user storage usage atomically
-    await db.update(users)
-      .set({ storageUsed: sql`${users.storageUsed} + ${file.size}` })
-      .where(eq(users.id, userId));
-
-    return c.json(successResponse(newFile, 'File uploaded successfully'), 201);
-  } catch (error: any) {
-    console.error('Upload error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
+/** File publik yang masih bisa diakses. File privat/trash/tidak ada dibalas 404 agar tidak bisa dienumerasi. */
+const findPublicFile = async (id: string) => {
+  const [record] = await db
+    .select()
+    .from(files)
+    .where(and(eq(files.id, id), eq(files.isPublic, true), isNull(files.deletedAt)));
+  if (!record) throw notFound('File tidak ditemukan atau tidak dibagikan');
+  if (record.expiresAt && record.expiresAt.getTime() <= Date.now()) {
+    throw new AppError(410, 'Tautan file ini sudah kedaluwarsa');
   }
+  return record;
+};
+
+const streamFile = async (c: Context, record: FileRecord, options: { download: boolean; cache: 'private' | 'public' }) => {
+  const stream = await DriveService.downloadStream(record.driveFileId, record.userId);
+  setFileResponseHeaders(c, record, options);
+  return c.body(stream);
+};
+
+const sendThumbnail = async (c: Context, record: FileRecord, cache: 'private' | 'public') => {
+  if (!record.fileType.startsWith('image/') && record.fileType !== 'application/pdf' && !record.fileType.startsWith('video/')) {
+    throw notFound('Thumbnail tidak tersedia');
+  }
+  const thumbnail = await DriveService.getThumbnail(record.driveFileId, record.userId);
+  if (thumbnail?.body) {
+    c.header('Content-Type', thumbnail.headers.get('content-type')?.startsWith('image/') ? thumbnail.headers.get('content-type')! : 'image/jpeg');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Content-Security-Policy', "default-src 'none'");
+    c.header('Cache-Control', `${cache}, max-age=3600`);
+    return c.body(thumbnail.body);
+  }
+  // Fallback: gambar kecil boleh dikirim apa adanya (hanya tipe yang aman ditampilkan).
+  if (isInlineSafe(record.fileType) && record.fileType.startsWith('image/') && record.fileSize <= 5 * 1024 * 1024) {
+    return streamFile(c, record, { download: false, cache });
+  }
+  throw notFound('Thumbnail tidak tersedia');
+};
+
+// ───────────────────────────── Owner (butuh login) ─────────────────────────────
+
+const uploadOptionsSchema = z.object({
+  isPublic: z.boolean(),
+  password: sharePasswordSchema.optional(),
+  expiresAt: futureDateSchema.optional(),
+  folderId: driveFolderIdSchema,
 });
 
-// GET /files/list (Protected - Dashboard View)
-filesRoute.get('/list', authMiddleware, async (c) => {
+const formString = (value: unknown) => (typeof value === 'string' && value.length > 0 ? value : undefined);
+
+// POST /files/upload
+filesRoute.post('/upload', authMiddleware, uploadRateLimit, uploadBodyLimit, validateFileMiddleware, async (c) => {
+  const file = c.get('validatedFile');
+  const userId = c.get('userId');
+  const body = c.get('uploadBody');
+
+  const options = parseOrThrow(uploadOptionsSchema, {
+    isPublic: body['isPublic'] !== 'false',
+    password: formString(body['password']),
+    expiresAt: formString(body['expiresAt']),
+    folderId: formString(body['folderId']) ?? 'root',
+  });
+
+  await reserveStorage(userId, file.size);
+
+  let driveFileId: string | undefined;
   try {
-    const userId = c.get('userId') as string;
-    const page = parseInt(c.req.query('page') || '1');
-    const limit = parseInt(c.req.query('limit') || '50');
-    const search = c.req.query('search') || '';
-    const sort = c.req.query('sort') || 'newest'; // newest, oldest, name_asc, name_desc, size_desc
-    const type = c.req.query('type') || ''; // image, document, video
-
-    const offset = (page - 1) * limit;
-
-    let conditions = and(
-      eq(files.userId, userId),
-      isNull(files.deletedAt)
-    );
-
-    if (search) {
-      conditions = and(conditions, ilike(files.fileName, `%${search}%`));
-    }
-
-    if (type) {
-      conditions = and(conditions, ilike(files.fileType, `${type}%`));
-    }
-
-    let orderByClause = desc(files.uploadedAt);
-    if (sort === 'oldest') orderByClause = asc(files.uploadedAt);
-    if (sort === 'name_asc') orderByClause = asc(files.fileName);
-    if (sort === 'name_desc') orderByClause = desc(files.fileName);
-    if (sort === 'size_desc') orderByClause = desc(files.fileSize);
-
-    const userFiles = await db.select().from(files)
-      .where(conditions)
-      .orderBy(orderByClause)
-      .limit(limit)
-      .offset(offset);
-
-    // Get total count for pagination metadata
-    const [countResult] = await db.select({ count: sql`count(*)`.mapWith(Number) })
-      .from(files).where(conditions);
-
-    // Strip passwords before sending to client
-    const safeFiles = userFiles.map(({ password, ...fileData }) => ({
-      ...fileData,
-      hasPassword: !!password
-    }));
-
-    return c.json(successResponse({
-      files: safeFiles,
-      pagination: {
-        total: countResult.count,
-        page,
-        limit,
-        totalPages: Math.ceil(countResult.count / limit)
-      }
-    }, 'Files retrieved successfully'));
-  } catch (error: any) {
-    console.error('List error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// GET /files/public (Public - View by username)
-filesRoute.get('/public', async (c) => {
-  try {
-    const username = c.req.query('username');
-    if (!username) {
-      return c.json(errorResponse('Username query is required', 400), 400);
-    }
-
-    const [user] = await db.select().from(users).where(
-      sql`LOWER(${users.username}) = ${username.toLowerCase()} OR (${users.username} IS NULL AND LOWER(REPLACE(${users.name}, ' ', '')) = ${username.toLowerCase()})`
-    );
-
-    if (!user) {
-      return c.json(errorResponse('User not found', 404), 404);
-    }
-
-    // Only non-deleted, public, and not-expired files
-    const publicFiles = await db.select().from(files).where(
-      and(
-        eq(files.userId, user.id),
-        eq(files.isPublic, true),
-        isNull(files.deletedAt),
-        sql`(${files.expiresAt} IS NULL OR ${files.expiresAt} > NOW())`
-      )
-    ).orderBy(desc(files.uploadedAt));
-
-    // Hide password protected links content URL (user needs to provide password via another endpoint to get link)
-    const sanitizedFiles = publicFiles.map(f => {
-      if (f.password) {
-         return { ...f, webContentLink: null, webViewLink: null, isPasswordProtected: true };
-      }
-      return { ...f, isPasswordProtected: false };
-    });
-
-    return c.json(successResponse(sanitizedFiles, 'Public files retrieved successfully'));
-  } catch (error: any) {
-    console.error('Public list error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// GET /files/trash (Protected)
-filesRoute.get('/trash', authMiddleware, async (c) => {
-  try {
-    const userId = c.get('userId') as string;
-    const trashedFiles = await db.select().from(files).where(
-      and(eq(files.userId, userId), isNotNull(files.deletedAt))
-    ).orderBy(desc(files.deletedAt));
-
-    const safeTrashedFiles = trashedFiles.map(({ password, ...fileData }) => ({
-      ...fileData,
-      hasPassword: !!password
-    }));
-
-    return c.json(successResponse(safeTrashedFiles, 'Trash retrieved successfully'));
-  } catch (error: any) {
-    console.error('Trash error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// DELETE /files/:id (Soft Delete)
-filesRoute.delete('/:id', authMiddleware, async (c) => {
-  try {
-    const id = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-
-    const [fileRecord] = await db.select().from(files).where(
-      and(eq(files.id, id), eq(files.userId, userId), isNull(files.deletedAt))
-    );
-
-    if (!fileRecord) {
-      return c.json(errorResponse('File not found or unauthorized', 404), 404);
-    }
-
-    await db.update(files).set({ deletedAt: new Date() }).where(eq(files.id, id));
-
-    return c.json(successResponse(null, 'File moved to trash'));
-  } catch (error: any) {
-    console.error('Soft delete error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// POST /files/:id/restore (Restore from Trash)
-filesRoute.post('/:id/restore', authMiddleware, async (c) => {
-  try {
-    const id = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-
-    const [fileRecord] = await db.select().from(files).where(
-      and(eq(files.id, id), eq(files.userId, userId), isNotNull(files.deletedAt))
-    );
-
-    if (!fileRecord) {
-      return c.json(errorResponse('File not found in trash', 404), 404);
-    }
-
-    await db.update(files).set({ deletedAt: null }).where(eq(files.id, id));
-
-    return c.json(successResponse(null, 'File restored successfully'));
-  } catch (error: any) {
-    console.error('Restore error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// DELETE /files/:id/force (Hard Delete)
-filesRoute.delete('/:id/force', authMiddleware, async (c) => {
-  try {
-    const id = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-
-    const [fileRecord] = await db.select().from(files).where(
-      and(eq(files.id, id), eq(files.userId, userId))
-    );
-
-    if (!fileRecord) {
-      return c.json(errorResponse('File not found', 404), 404);
-    }
-
-    try {
-        await DriveService.deleteFromDrive(fileRecord.driveFileId, userId);
-    } catch (e: any) {
-        console.error('Warning: could not delete from drive', e);
-    }
-
-    await db.delete(files).where(eq(files.id, id));
-
-    // Atomic storage decrement
-    await db.update(users)
-       .set({ storageUsed: sql`GREATEST(0, ${users.storageUsed} - ${fileRecord.fileSize})` })
-       .where(eq(users.id, userId));
-
-    return c.json(successResponse(null, 'File permanently deleted'));
-  } catch (error: any) {
-    console.error('Force delete error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// POST /files/:id/unlock (Public - Unlock password protected file)
-filesRoute.post('/:id/unlock', rateLimitMiddleware, async (c) => {
-  try {
-    const id = c.req.param('id') as string;
-    const body = await c.req.parseBody();
-    const password = body['password'];
-
-    if (!password || typeof password !== 'string') {
-       return c.json(errorResponse('Password is required', 400), 400);
-    }
-
-    const [fileRecord] = await db.select().from(files).where(
-      and(
-         eq(files.id, id), 
-         eq(files.isPublic, true),
-         isNull(files.deletedAt),
-         sql`(${files.expiresAt} IS NULL OR ${files.expiresAt} > NOW())`
-      )
-    );
-
-    if (!fileRecord) {
-      return c.json(errorResponse('File not found or expired', 404), 404);
-    }
-
-    const isMatch = fileRecord.password && await bcrypt.compare(password, fileRecord.password);
-    if (!isMatch) {
-      return c.json(errorResponse('Incorrect password', 403), 403);
-    }
-
-    return c.json(successResponse({
-      webContentLink: fileRecord.webContentLink,
-      webViewLink: fileRecord.webViewLink
-    }, 'File unlocked successfully'));
-
-  } catch (error: any) {
-    console.error('Unlock error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// GET /files/public/:id
-// Get public file metadata (used for the Share Page)
-filesRoute.get('/public/:id', async (c) => {
-  try {
-    const fileId = c.req.param('id') as string;
-    const [fileRecord] = await db.select({
-      id: files.id,
-      fileName: files.fileName,
-      fileSize: files.fileSize,
-      fileType: files.fileType,
-      isPublic: files.isPublic,
-      hasPassword: isNotNull(files.password),
-      expiresAt: files.expiresAt,
-      uploadedAt: files.uploadedAt
-    }).from(files).where(eq(files.id, fileId));
-
-    if (!fileRecord) return c.json(errorResponse('File not found', 404), 404);
-    if (!fileRecord.isPublic) return c.json(errorResponse('File is not public', 403), 403);
-    
-    if (fileRecord.expiresAt && new Date(fileRecord.expiresAt) < new Date()) {
-      return c.json(errorResponse('Link expired', 410), 410);
-    }
-
-    return c.json(successResponse(fileRecord, 'File found'));
-  } catch (error: any) {
-    return c.json(errorResponse('Internal Server Error'), 500);
-  }
-});
-
-// GET /files/public/:id/stream
-// Streams the file content directly from Google Drive through our backend proxy
-filesRoute.get('/public/:id/stream', async (c) => {
-  try {
-    const fileId = c.req.param('id') as string;
-    const password = c.req.query('password');
-
-    const [fileRecord] = await db.select().from(files).where(eq(files.id, fileId));
-
-    if (!fileRecord) return c.json(errorResponse('File not found', 404), 404);
-    if (!fileRecord.isPublic) return c.json(errorResponse('File is not public', 403), 403);
-    
-    if (fileRecord.expiresAt && new Date(fileRecord.expiresAt) < new Date()) {
-      return c.json(errorResponse('Link expired', 410), 410);
-    }
-
-    if (fileRecord.password) {
-      if (!password) return c.json(errorResponse('Password required', 401), 401);
-      const isMatch = await bcrypt.compare(password, fileRecord.password);
-      if (!isMatch) return c.json(errorResponse('Incorrect password', 403), 403);
-    }
-
-    // Proxy download stream from Drive
-    const streamInfo = await DriveService.downloadStream(fileRecord.driveFileId, fileRecord.userId);
-    
-    // Set headers for file download
-    c.header('Content-Type', fileRecord.fileType);
-    c.header('Content-Disposition', `inline; filename="${fileRecord.fileName}"`);
-    c.header('Content-Length', fileRecord.fileSize.toString());
-
-    return new Response(streamInfo.stream as unknown as ReadableStream);
-  } catch (error: any) {
-    console.error('Stream error:', error);
-    return c.json(errorResponse('Failed to stream file'), 500);
-  }
-});
-
-// GET /files/:id/stream (Private)
-filesRoute.get('/:id/stream', authMiddleware, async (c) => {
-  try {
-    const fileId = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-
-    const [fileRecord] = await db.select().from(files).where(and(eq(files.id, fileId), eq(files.userId, userId)));
-    if (!fileRecord) return c.json(errorResponse('File not found', 404), 404);
-
-    const streamInfo = await DriveService.downloadStream(fileRecord.driveFileId, userId);
-    
-    c.header('Content-Type', fileRecord.fileType);
-    c.header('Content-Disposition', `inline; filename="${fileRecord.fileName}"`);
-    c.header('Content-Length', fileRecord.fileSize.toString());
-
-    return new Response(streamInfo.stream as unknown as ReadableStream);
-  } catch (error: any) {
-    console.error('Private Stream error:', error);
-    return c.json(errorResponse('Failed to stream file'), 500);
-  }
-});
-
-// GET /files/drive-stream/:driveFileId (Protected) - Stream directly by driveFileId
-filesRoute.get('/drive-stream/:driveFileId', authMiddleware, async (c) => {
-  try {
-    const driveFileId = c.req.param('driveFileId') as string;
-    const userId = c.get('userId') as string;
-    
-    // We get metadata from query to set headers
-    const mimeType = c.req.query('mimeType') || 'application/octet-stream';
-    const fileName = c.req.query('fileName') || 'file';
-
-    const streamInfo = await DriveService.downloadStream(driveFileId, userId);
-    
-    c.header('Content-Type', mimeType);
-    c.header('Content-Disposition', `inline; filename="${fileName}"`);
-
-    return new Response(streamInfo.stream as unknown as ReadableStream);
-  } catch (error: any) {
-    console.error('Drive Stream error:', error);
-    return c.json(errorResponse('Failed to stream file from Drive'), 500);
-  }
-});
-
-// PUT /files/:id/position (Protected)
-filesRoute.put('/:id/position', authMiddleware, async (c) => {
-  try {
-    const fileId = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-    const body = await c.req.json();
-    const { posX, posY } = body;
-
-    if (typeof posX !== 'number' || typeof posY !== 'number') {
-      return c.json(errorResponse('posX and posY are required and must be numbers', 400), 400);
-    }
-
-    const [updatedFile] = await db.update(files)
-      .set({ posX: Math.round(posX), posY: Math.round(posY) })
-      .where(and(eq(files.id, fileId), eq(files.userId, userId)))
-      .returning();
-
-    if (!updatedFile) {
-      return c.json(errorResponse('File not found', 404), 404);
-    }
-
-    return c.json(successResponse(updatedFile, 'Position updated'));
-  } catch (error: any) {
-    console.error('Update position error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// PUT /files/:id/rename (Protected)
-filesRoute.put('/:id/rename', authMiddleware, async (c) => {
-  try {
-    const fileId = c.req.param('id') as string;
-    const userId = c.get('userId') as string;
-    const body = await c.req.json();
-    const { fileName } = body;
-
-    if (!fileName || typeof fileName !== 'string' || fileName.trim().length === 0) {
-      return c.json(errorResponse('Valid fileName is required', 400), 400);
-    }
-
-    const [updatedFile] = await db.update(files)
-      .set({ fileName: fileName.trim() })
-      .where(and(eq(files.id, fileId), eq(files.userId, userId)))
-      .returning();
-
-    if (!updatedFile) {
-      return c.json(errorResponse('File not found', 404), 404);
-    }
-
-    return c.json(successResponse(updatedFile, 'File renamed successfully'));
-  } catch (error: any) {
-    console.error('Rename error:', error);
-    return c.json(errorResponse(error.message || 'Internal Server Error'), 500);
-  }
-});
-
-// GET /files/drive-files (Protected) - Fetch from Google Drive API
-filesRoute.get('/drive-files', authMiddleware, async (c) => {
-  try {
-    const userId = c.get('userId');
-    const folderId = c.req.query('folderId') || 'root';
-    const driveFiles = await DriveService.listFilesFromFolder(userId, folderId);
-    return c.json(successResponse(driveFiles, 'Drive files retrieved'));
-  } catch (error: any) {
-    return c.json(errorResponse(error.message), 500);
-  }
-});
-
-// POST /files/sync (Protected) - Sync files from Drive into DB
-filesRoute.post('/sync', authMiddleware, async (c) => {
-  try {
-    const userId = c.get('userId');
-    const body = await c.req.json();
-    const { filesToSync, folderId } = body;
-
-    if (!Array.isArray(filesToSync) || filesToSync.length === 0) {
-      return c.json(errorResponse('No files provided'), 400);
-    }
-
-    const newFiles = [];
-    for (const f of filesToSync) {
-      // Check if file is already in our DB to prevent duplicates
-      const [existingFile] = await db.select().from(files).where(and(eq(files.driveFileId, f.driveFileId), eq(files.userId, userId)));
-      if (existingFile) continue;
-
-      let links = { webContentLink: null, webViewLink: null };
-      try {
-        const publicLinks = await DriveService.generatePublicLink(f.driveFileId, userId);
-        links = publicLinks as any;
-      } catch (err) {
-        console.error("Could not generate public link for", f.fileName, err);
-      }
-
-      const [newFile] = await db.insert(files).values({
+    const driveFile = await DriveService.uploadToDrive(file, userId, options.folderId);
+    driveFileId = driveFile.id;
+
+    const [newFile] = await db
+      .insert(files)
+      .values({
         userId,
-        folderId: folderId && folderId !== 'root' ? folderId : null,
-        driveFileId: f.driveFileId,
-        fileName: f.fileName,
-        fileType: f.mimeType,
-        fileSize: f.size ? parseInt(f.size, 10) : 0,
-        isPublic: true,
-        webContentLink: links.webContentLink,
-        webViewLink: links.webViewLink,
-        posX: 0,
-        posY: 0,
-      }).returning();
-      newFiles.push(newFile);
-      
-      await db.update(users)
-        .set({ storageUsed: sql`${users.storageUsed} + ${f.size ? parseInt(f.size, 10) : 0}` })
-        .where(eq(users.id, userId));
-    }
+        folderId: options.folderId === 'root' ? null : options.folderId,
+        driveFileId: driveFile.id,
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+        isPublic: options.isPublic,
+        password: options.password ? await bcrypt.hash(options.password, BCRYPT_ROUNDS) : null,
+        expiresAt: options.expiresAt ?? null,
+        webViewLink: driveFile.webViewLink,
+      })
+      .returning();
 
-    return c.json(successResponse(newFiles, 'Files synced successfully'), 201);
-  } catch (error: any) {
-    console.error('Sync error:', error);
-    return c.json(errorResponse(error.message), 500);
+    return c.json(successResponse(toOwnerFile(newFile), 'File berhasil diunggah'), 201);
+  } catch (error) {
+    // Kompensasi: kembalikan kuota dan hapus file yatim di Drive bila penyimpanan ke DB gagal.
+    await releaseStorage(userId, file.size).catch((e) => console.error('[upload] gagal mengembalikan kuota', e));
+    if (driveFileId) {
+      await DriveService.deleteFromDrive(driveFileId, userId).catch((e) =>
+        console.error('[upload] gagal menghapus file yatim di Drive', driveFileId, e),
+      );
+    }
+    throw error;
   }
+});
+
+// GET /files/list
+filesRoute.get('/list', authMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const { page, limit, search, sort, type } = parseOrThrow(listQuerySchema, c.req.query());
+
+  const conditions = and(
+    eq(files.userId, userId),
+    isNull(files.deletedAt),
+    search ? ilike(files.fileName, `%${escapeLike(search)}%`) : undefined,
+    type === 'pdf' ? eq(files.fileType, FILE_TYPE_FILTERS.pdf) : undefined,
+    type === 'image' || type === 'video' ? like(files.fileType, `${FILE_TYPE_FILTERS[type]}%`) : undefined,
+  );
+
+  const orderBy = {
+    newest: desc(files.uploadedAt),
+    oldest: asc(files.uploadedAt),
+    name_asc: asc(files.fileName),
+    name_desc: desc(files.fileName),
+    size_desc: desc(files.fileSize),
+  }[sort];
+
+  const [userFiles, [{ count }]] = await Promise.all([
+    db.select().from(files).where(conditions).orderBy(orderBy, desc(files.id)).limit(limit).offset((page - 1) * limit),
+    db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(files).where(conditions),
+  ]);
+
+  return c.json(
+    successResponse(
+      {
+        files: userFiles.map(toOwnerFile),
+        pagination: { total: count, page, limit, totalPages: Math.max(1, Math.ceil(count / limit)) },
+      },
+      'Files retrieved successfully',
+    ),
+  );
+});
+
+// GET /files/trash
+filesRoute.get('/trash', authMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const trashedFiles = await db
+    .select()
+    .from(files)
+    .where(and(eq(files.userId, userId), isNotNull(files.deletedAt)))
+    .orderBy(desc(files.deletedAt))
+    .limit(500);
+
+  return c.json(successResponse(trashedFiles.map(toOwnerFile), 'Trash retrieved successfully'));
+});
+
+// POST /files/sync — impor file yang dipilih pengguna lewat Google Picker
+filesRoute.post('/sync', authMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const { driveFileIds } = parseOrThrow(syncSchema, await readJson(c));
+  const uniqueIds = [...new Set(driveFileIds)];
+
+  const existing = await db
+    .select({ driveFileId: files.driveFileId })
+    .from(files)
+    .where(and(eq(files.userId, userId), inArray(files.driveFileId, uniqueIds)));
+  const existingIds = new Set(existing.map((f) => f.driveFileId));
+  const candidates = uniqueIds.filter((id) => !existingIds.has(id));
+
+  // Metadata (nama, tipe, ukuran) selalu diambil dari Drive — input client tidak dipercaya.
+  const results = await mapWithConcurrency(candidates, 5, (id) => DriveService.getFileMetadata(id, userId));
+  const metas = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+  const importable = metas.filter((m) => !m.mimeType.startsWith(GOOGLE_APPS_MIME_PREFIX));
+  const skipped = uniqueIds.length - importable.length;
+
+  if (importable.length === 0) {
+    return c.json(successResponse({ files: [], skipped }, 'Tidak ada file baru untuk disinkronkan'));
+  }
+
+  const totalSize = importable.reduce((sum, m) => sum + m.size, 0);
+  await reserveStorage(userId, totalSize);
+
+  try {
+    const inserted = await db
+      .insert(files)
+      .values(
+        importable.map((m) => ({
+          userId,
+          folderId: m.parentId,
+          driveFileId: m.id,
+          fileName: m.name.slice(0, 255),
+          fileType: m.mimeType.slice(0, 255),
+          fileSize: m.size,
+          // File hasil sinkronisasi privat secara default; pemilik bisa membagikannya lewat menu Bagikan.
+          isPublic: false,
+          webViewLink: m.webViewLink,
+        })),
+      )
+      .returning();
+
+    return c.json(successResponse({ files: inserted.map(toOwnerFile), skipped }, 'Files synced successfully'), 201);
+  } catch (error) {
+    await releaseStorage(userId, totalSize).catch((e) => console.error('[sync] gagal mengembalikan kuota', e));
+    throw error;
+  }
+});
+
+// DELETE /files/:id — pindahkan ke trash
+filesRoute.delete('/:id', authMiddleware, async (c) => {
+  const record = await findOwnedFile(fileIdParam(c), c.get('userId'), 'active');
+  await db.update(files).set({ deletedAt: new Date() }).where(eq(files.id, record.id));
+  return c.json(successResponse(null, 'File dipindahkan ke tong sampah'));
+});
+
+// POST /files/:id/restore
+filesRoute.post('/:id/restore', authMiddleware, async (c) => {
+  const record = await findOwnedFile(fileIdParam(c), c.get('userId'), 'trashed');
+  await db.update(files).set({ deletedAt: null }).where(eq(files.id, record.id));
+  return c.json(successResponse(null, 'File berhasil dipulihkan'));
+});
+
+// DELETE /files/:id/force — hapus permanen (Drive + DB)
+filesRoute.delete('/:id/force', authMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const record = await findOwnedFile(fileIdParam(c), userId);
+
+  // Jika Drive gagal, data DB dipertahankan agar file tidak menjadi yatim dan kuota tetap konsisten.
+  await DriveService.deleteFromDrive(record.driveFileId, userId);
+
+  await db.transaction(async (tx) => {
+    await tx.delete(files).where(eq(files.id, record.id));
+    await releaseStorage(userId, record.fileSize, tx);
+  });
+
+  return c.json(successResponse(null, 'File dihapus permanen'));
+});
+
+// GET /files/:id/stream (pemilik) — ?download=1 untuk memaksa unduhan
+filesRoute.get('/:id/stream', authMiddleware, async (c) => {
+  const record = await findOwnedFile(fileIdParam(c), c.get('userId'));
+  return streamFile(c, record, { download: c.req.query('download') === '1', cache: 'private' });
+});
+
+// GET /files/:id/thumbnail (pemilik)
+filesRoute.get('/:id/thumbnail', authMiddleware, async (c) => {
+  const record = await findOwnedFile(fileIdParam(c), c.get('userId'));
+  return sendThumbnail(c, record, 'private');
+});
+
+// PUT /files/:id/position
+filesRoute.put('/:id/position', authMiddleware, async (c) => {
+  const id = fileIdParam(c);
+  const { posX, posY } = parseOrThrow(positionSchema, await readJson(c));
+  const [updated] = await db
+    .update(files)
+    .set({ posX, posY })
+    .where(and(eq(files.id, id), eq(files.userId, c.get('userId'))))
+    .returning();
+  if (!updated) throw notFound('File tidak ditemukan');
+  return c.json(successResponse(toOwnerFile(updated), 'Position updated'));
+});
+
+// PUT /files/:id/rename — nama di Drive dan DB tetap sinkron
+filesRoute.put('/:id/rename', authMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const record = await findOwnedFile(fileIdParam(c), userId, 'active');
+  const { fileName } = parseOrThrow(renameSchema, await readJson(c));
+
+  await DriveService.renameFile(record.driveFileId, fileName, userId);
+  const [updated] = await db.update(files).set({ fileName }).where(eq(files.id, record.id)).returning();
+  return c.json(successResponse(toOwnerFile(updated), 'Nama file berhasil diubah'));
+});
+
+// PUT /files/:id/share — atur publik/privat, password, dan kedaluwarsa tautan
+filesRoute.put('/:id/share', authMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const record = await findOwnedFile(fileIdParam(c), userId, 'active');
+  const input = parseOrThrow(shareSettingsSchema, await readJson(c));
+
+  const update: Partial<typeof files.$inferInsert> = {};
+  if (input.isPublic !== undefined) update.isPublic = input.isPublic;
+  if (input.password !== undefined) {
+    update.password = input.password === null ? null : await bcrypt.hash(input.password, BCRYPT_ROUNDS);
+  }
+  if (input.expiresAt !== undefined) update.expiresAt = input.expiresAt;
+
+  if (Object.keys(update).length === 0) {
+    return c.json(successResponse(toOwnerFile(record), 'Tidak ada perubahan'));
+  }
+
+  const [updated] = await db.update(files).set(update).where(eq(files.id, record.id)).returning();
+
+  // File lama mungkin masih punya izin "anyone with link" di Drive yang bisa melewati
+  // password/kedaluwarsa. Cabut agar semua akses publik lewat backend.
+  await DriveService.revokePublicAccess(record.driveFileId, userId).catch((e) =>
+    console.error('[share] gagal mencabut akses publik Drive', record.id, e),
+  );
+
+  return c.json(successResponse(toOwnerFile(updated), 'Pengaturan berbagi disimpan'));
+});
+
+// ───────────────────────────────── Publik ─────────────────────────────────
+
+// GET /files/public?username=&page=&limit=
+filesRoute.get('/public', async (c) => {
+  const { username, page, limit } = parseOrThrow(publicListQuerySchema, c.req.query());
+  const normalized = username.toLowerCase();
+
+  // Utamakan username resmi; fallback ke nama tanpa spasi hanya bila hasilnya tepat satu user.
+  let [user] = await db.select({ id: users.id }).from(users).where(eq(users.username, normalized)).limit(1);
+  if (!user) {
+    const candidates = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(isNull(users.username), sql`LOWER(REPLACE(${users.name}, ' ', '')) = ${normalized}`))
+      .limit(2);
+    if (candidates.length === 1) user = candidates[0];
+  }
+  if (!user) throw notFound('Pengguna tidak ditemukan');
+
+  const conditions = and(eq(files.userId, user.id), publiclyAccessible());
+  const [publicFiles, [{ count }]] = await Promise.all([
+    db.select().from(files).where(conditions).orderBy(desc(files.uploadedAt), desc(files.id)).limit(limit).offset((page - 1) * limit),
+    db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(files).where(conditions),
+  ]);
+
+  return c.json(
+    successResponse(
+      {
+        files: publicFiles.map(toPublicFile),
+        pagination: { total: count, page, limit, totalPages: Math.max(1, Math.ceil(count / limit)) },
+      },
+      'Public files retrieved successfully',
+    ),
+  );
+});
+
+// GET /files/public/:id — metadata untuk halaman share
+filesRoute.get('/public/:id', async (c) => {
+  const record = await findPublicFile(fileIdParam(c));
+  return c.json(successResponse(toPublicFile(record), 'File found'));
+});
+
+// POST /files/public/:id/unlock — verifikasi password, balas token stream berumur pendek
+filesRoute.post('/public/:id/unlock', unlockRateLimit, async (c) => {
+  const record = await findPublicFile(fileIdParam(c));
+  const { password } = parseOrThrow(unlockSchema, await readJson(c));
+
+  if (!record.password) throw badRequest('File ini tidak dilindungi password');
+  if (!(await bcrypt.compare(password, record.password))) {
+    throw new AppError(403, 'Password salah');
+  }
+
+  return c.json(successResponse(createStreamToken(record.id, record.password), 'File berhasil dibuka'));
+});
+
+// GET /files/public/:id/stream?token=&download=1
+filesRoute.get('/public/:id/stream', async (c) => {
+  const record = await findPublicFile(fileIdParam(c));
+
+  if (record.password) {
+    const token = c.req.query('token');
+    if (!token || !verifyStreamToken(token, record.id, record.password)) {
+      throw unauthorized('Password diperlukan untuk mengakses file ini');
+    }
+  }
+
+  return streamFile(c, record, {
+    download: c.req.query('download') === '1',
+    cache: record.password ? 'private' : 'public',
+  });
+});
+
+// GET /files/public/:id/thumbnail — tidak tersedia untuk file berpassword
+filesRoute.get('/public/:id/thumbnail', async (c) => {
+  const record = await findPublicFile(fileIdParam(c));
+  if (record.password) throw notFound('Thumbnail tidak tersedia');
+  return sendThumbnail(c, record, 'public');
 });

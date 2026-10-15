@@ -9,7 +9,9 @@
     "start": "node --env-file=.env dist/index.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "test": "vitest run"
+    "test": "vitest run",
+    "revoke-public-links": "tsx --env-file=.env src/scripts/revokePublicLinks.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",

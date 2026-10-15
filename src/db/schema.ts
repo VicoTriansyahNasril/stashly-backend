@@ -73,13 +73,14 @@ export const folders = pgTable('folders', {
 export const files = pgTable('files', {
   id: uuid('id').defaultRandom().primaryKey(),
   userId: text('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(), // Relates file to user
-  folderId: uuid('folder_id').references(() => folders.id, { onDelete: 'set null' }), // Relates file to a folder
+  // ID folder Google Drive tempat file berada (null = root). Folder dikelola di Drive, bukan di tabel `folders`.
+  folderId: varchar('folder_id', { length: 255 }),
   driveFileId: varchar('drive_file_id', { length: 255 }).notNull(),
   fileName: varchar('file_name', { length: 255 }).notNull(),
   fileType: varchar('file_type', { length: 255 }).notNull(),
   fileSize: bigint('file_size', { mode: 'number' }).notNull(), // Use bigint for sizes > 2GB
   isPublic: boolean('is_public').default(true).notNull(),
-  password: varchar('password', { length: 255 }), // For protected sharing
+  password: varchar('password', { length: 255 }), // bcrypt hash, untuk tautan berpassword
   expiresAt: timestamp('expires_at', { mode: 'date' }), // For limited time sharing
   webContentLink: varchar('web_content_link', { length: 1024 }),
   webViewLink: varchar('web_view_link', { length: 1024 }),
@@ -94,5 +95,6 @@ export const files = pgTable('files', {
     fileTypeIdx: index("file_type_idx").on(table.fileType),
     deletedAtIdx: index("deleted_at_idx").on(table.deletedAt),
     uploadedAtIdx: index("uploaded_at_idx").on(table.uploadedAt),
+    userDriveFileIdx: index("user_drive_file_idx").on(table.userId, table.driveFileId),
   };
 });
